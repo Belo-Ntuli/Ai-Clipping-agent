@@ -7,16 +7,28 @@ export type Env = {
   FREEBUFF_CLIENT_ID?: string
   FREEBUFF_ISSUER?: string
   APP_ORIGIN?: string
+  /** Development only: extra hostnames allowed to use the preview identity. */
+  LOCAL_PREVIEW_HOSTS?: string
 }
 
 const LOOPBACK = new Set(['localhost', '127.0.0.1', '[::1]'])
 
+/**
+ * The preview identity exists so a first run works without provisioning. It is
+ * limited to loopback, plus any hostname the operator names explicitly through
+ * LOCAL_PREVIEW_HOSTS — a development affordance for inspecting the dashboard
+ * through a tunnel. It is still refused the moment real auth is configured, and
+ * a deployment never sets that variable.
+ */
 export function isLocalPreview(request: Request, env: Env): boolean {
-  return (
-    !env.FREEBUFF_CLIENT_ID &&
-    !env.APP_ORIGIN &&
-    LOOPBACK.has(new URL(request.url).hostname)
-  )
+  if (env.FREEBUFF_CLIENT_ID || env.APP_ORIGIN) return false
+  const host = new URL(request.url).hostname
+  if (LOOPBACK.has(host)) return true
+  const extra = (env.LOCAL_PREVIEW_HOSTS ?? '')
+    .split(',')
+    .map((entry) => entry.trim())
+    .filter(Boolean)
+  return extra.includes(host)
 }
 
 let cached: { key: string; auth: FreebuffAuth } | undefined

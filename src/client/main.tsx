@@ -4,6 +4,7 @@ import type {
   Candidate,
   Overview,
   Platform,
+  Policy,
   Session,
 } from '../shared/types'
 import './style.css'
@@ -39,6 +40,7 @@ const emptyOverview: Overview = {
   candidates: [],
   events: [],
   runners: [],
+  policy: { paused: false, allowedCategories: [], blockedTerms: [], updatedAt: 0 },
 }
 
 function App() {
@@ -53,6 +55,8 @@ function App() {
   const [platform, setPlatform] = useState<Platform>('twitch')
   const [channel, setChannel] = useState('')
   const [label, setLabel] = useState('')
+  const [categoryDraft, setCategoryDraft] = useState('')
+  const [termDraft, setTermDraft] = useState('')
   const sessionRef = useRef<Session | null>(null)
 
   const enabled = Boolean(loaded && session?.user && session.database)
@@ -117,11 +121,29 @@ function App() {
     () => overview.candidates.filter((item) => item.status === 'new'),
     [overview.candidates],
   )
+  // Filtered moments are listed apart: they were never reviewable, and no clip
+  // was cut for them.
+  const blocked = useMemo(
+    () => overview.candidates.filter((item) => item.status === 'blocked'),
+    [overview.candidates],
+  )
   const queue = useMemo(
-    () => overview.candidates.filter((item) => item.status !== 'new'),
+    () =>
+      overview.candidates.filter(
+        (item) => item.status === 'approved' || item.status === 'rejected',
+      ),
     [overview.candidates],
   )
   const liveSources = overview.sources.filter((source) => source.active)
+  // Categories the platforms report right now, offered as one-click allows.
+  const seenCategories = useMemo(() => {
+    const seen = new Set<string>()
+    for (const source of overview.sources) {
+      const category = source.category?.trim()
+      if (category) seen.add(category)
+    }
+    return [...seen].sort((a, b) => a.localeCompare(b))
+  }, [overview.sources])
   const onlineRunners = overview.runners.filter((runner) => runner.online)
 
   async function addSource(event: React.FormEvent) {
@@ -139,6 +161,17 @@ function App() {
       })
       setChannel('')
       setLabel('')
+    })
+  }
+
+  async function savePolicy(patch: Partial<Policy>) {
+    if (!enabled || busy) return
+    await act(async () => {
+      await request('/api/policy', {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(patch),
+      })
     })
   }
 
@@ -302,10 +335,20 @@ function App() {
                           {candidate.signals.messages} msgs
                         </em>
                       </div>
+                      {candidate.clip && (
+                        <span className="clip-badge" title={candidate.clip.fileName}>
+                          clip
+                        </span>
+                      )}
                       <span className={`status ${candidate.status}`}>
                         {candidate.status}
                       </span>
                     </div>
+                    {candidate.status === 'blocked' && candidate.blockReason && (
+                      <p className="chat-sample filtered">
+                        Filtered: {candidate.blockReason}
+                      </p>
+                    )}
                     {candidate.sample.length > 0 && (
                       <p className="chat-sample">
                         {candidate.sample.slice(0, 3).join('  ·  ')}
@@ -326,8 +369,8 @@ function App() {
             <span>{pending.length} waiting</span>
           </div>
           <p className="hint">
-            Approving marks a moment as keep. There is no auto-poster connected
-            yet — posting and campaign submission arrive in the next phase.
+            Approving marks a moment as keep. Clips are cut on the runner and
+            stay there: there is no upload or auto-poster connected yet.
           </p>
           {!pending.length ? (
             <div className="empty">
@@ -365,6 +408,17 @@ function App() {
                       )}
                       <span className="muted">chat signal only</span>
                     </div>
+                    {candidate.clip ? (
+                      <p className="clip-line">
+                        Clip cut on the runner · {candidate.clip.fileName} ·{' '}
+                        {(candidate.clip.durationMs / 1000).toFixed(1)}s ·{' '}
+                        {(candidate.clip.bytes / 1_048_576).toFixed(1)} MB
+                      </p>
+                    ) : (
+                      <p className="clip-line muted">
+                        No clip: this moment was detected from chat only.
+                      </p>
+                    )}
                     {candidate.sample.length > 0 && (
                       <ul className="chat-lines">
                         {candidate.sample.map((line, index) => (
@@ -391,6 +445,31 @@ function App() {
                 </li>
               ))}
             </ul>
+          )}
+          {blocked.length > 0 && (
+            <>
+              <div className="section-heading spaced">
+                <h2>Filtered by your rules</h2>
+                <span>{blocked.length}</span>
+              </div>
+              <p className="hint">
+                These never reached the queue and no clip was cut for them.
+                Reasons come from your content rules.
+              </p>
+              <ul className="decided">
+                {blocked.slice(0, 12).map((candidate) => (
+                  <li key={candidate.id}>
+                    <span className="status blocked">blocked</span>
+                    <span>
+                      {candidate.channel} · {clock(candidate.windowEnd)}
+                    </span>
+                    <span className="muted">
+                      {candidate.blockReason ?? 'content rule'}
+                    </span>
+                  </li>
+                ))}
+              </ul>
+            </>
           )}
           {queue.length > 0 && (
             <>
@@ -478,8 +557,12 @@ function App() {
                       <strong>{source.label || source.channel}</strong>
                       <em>
                         {source.platform} · {source.channel}
+                        {source.category ? ` · ${source.category}` : ''}
                         {source.active ? '' : ' · paused'}
                       </em>
+                      {source.approvedAt === null && (
+                        <span className="status blocked">not approved</span>
+                      )}
                     </div>
                     <div className="row-actions">
                       <button
@@ -515,6 +598,158 @@ function App() {
                 ))}
               </ul>
             )}
+          </section>
+
+          <section aria-labelledby="rules-title" className="rules">
+            <div className="section-heading">
+              <h2 id="rules-title">Content rules</h2>
+              <span>
+                {overview.policy.paused ? 'paused' : 'enforced'}
+              </span>
+            </div>
+            <p className="hint">
+              Every moment is checked against these before anything is cut. A
+              refused moment is listed as filtered, with its reason.
+            </p>
+            <label className="switch" htmlFor="paused">
+              <input
+                id="paused"
+                type="checkbox"
+                checked={overview.policy.paused}
+                disabled={!enabled || busy}
+                onChange={() =>
+                  void savePolicy({ paused: !overview.policy.paused })
+                }
+              />
+              Pause all clipping
+            </label>
+
+            <div className="rule-group">
+              <h3>Only these categories</h3>
+              <p className="hint">
+                Empty means any category. Categories come from the platform, so
+                a channel with no reported category is refused while this list
+                is set.
+              </p>
+              <ul className="chips">
+                {overview.policy.allowedCategories.map((entry) => (
+                  <li key={entry}>
+                    {entry}
+                    <button
+                      aria-label={`Remove ${entry}`}
+                      disabled={busy}
+                      onClick={() =>
+                        void savePolicy({
+                          allowedCategories:
+                            overview.policy.allowedCategories.filter(
+                              (item) => item !== entry,
+                            ),
+                        })
+                      }
+                    >
+                      ×
+                    </button>
+                  </li>
+                ))}
+              </ul>
+              <form
+                className="inline-form"
+                onSubmit={(event) => {
+                  event.preventDefault()
+                  const entry = categoryDraft.trim()
+                  if (!entry) return
+                  void savePolicy({
+                    allowedCategories: [
+                      ...overview.policy.allowedCategories,
+                      entry,
+                    ],
+                  }).then(() => setCategoryDraft(''))
+                }}
+              >
+                <input
+                  aria-label="Category to allow"
+                  maxLength={60}
+                  placeholder="e.g. Grand Theft Auto V"
+                  value={categoryDraft}
+                  onChange={(e) => setCategoryDraft(e.target.value)}
+                />
+                <button disabled={!enabled || busy || !categoryDraft.trim()}>
+                  Add
+                </button>
+              </form>
+              {seenCategories.length > 0 && (
+                <p className="hint">
+                  Seen now:{' '}
+                  {seenCategories.map((entry) => (
+                    <button
+                      key={entry}
+                      className="quiet"
+                      disabled={busy}
+                      onClick={() =>
+                        void savePolicy({
+                          allowedCategories: [
+                            ...overview.policy.allowedCategories,
+                            entry,
+                          ],
+                        })
+                      }
+                    >
+                      {entry}
+                    </button>
+                  ))}
+                </p>
+              )}
+            </div>
+
+            <div className="rule-group">
+              <h3>Never clip these words</h3>
+              <p className="hint">
+                If one of these appears in the chat around a moment, the moment
+                is refused and no clip is cut.
+              </p>
+              <ul className="chips blocked">
+                {overview.policy.blockedTerms.map((entry) => (
+                  <li key={entry}>
+                    {entry}
+                    <button
+                      aria-label={`Remove ${entry}`}
+                      disabled={busy}
+                      onClick={() =>
+                        void savePolicy({
+                          blockedTerms: overview.policy.blockedTerms.filter(
+                            (item) => item !== entry,
+                          ),
+                        })
+                      }
+                    >
+                      ×
+                    </button>
+                  </li>
+                ))}
+              </ul>
+              <form
+                className="inline-form"
+                onSubmit={(event) => {
+                  event.preventDefault()
+                  const entry = termDraft.trim()
+                  if (!entry) return
+                  void savePolicy({
+                    blockedTerms: [...overview.policy.blockedTerms, entry],
+                  }).then(() => setTermDraft(''))
+                }}
+              >
+                <input
+                  aria-label="Word to block"
+                  maxLength={40}
+                  placeholder="e.g. a topic you never want clipped"
+                  value={termDraft}
+                  onChange={(e) => setTermDraft(e.target.value)}
+                />
+                <button disabled={!enabled || busy || !termDraft.trim()}>
+                  Block
+                </button>
+              </form>
+            </div>
           </section>
         </div>
       )}

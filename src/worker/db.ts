@@ -1,17 +1,36 @@
 import type {
   Candidate,
   CandidateStatus,
+  ClipInfo,
   LogEvent,
   Platform,
+  Policy,
   RunnerInfo,
   Signals,
   Source,
 } from '../shared/types'
 
+/** Sensible starting blocklist. The owner can edit it; it is not exhaustive. */
+export const DEFAULT_BLOCKED_TERMS = [
+  'cocaine',
+  'heroin',
+  'meth',
+  'fentanyl',
+  'overdose',
+  'shooting up',
+  'syrup',
+  'xanax',
+  'drug deal',
+  'suicide',
+  'self harm',
+  'porn',
+  'nudes',
+  'onlyfans',
+]
+
 /**
- * Phase A schema: sources, runners, candidates and an agent event log.
- * Job leases and clips arrive in phase B; this file is the single place
- * migrations are appended, so later phases add tables here, not elsewhere.
+ * Phase A schema: sources, runners, candidates, an agent event log and the
+ * owner's content policy. Later phases append tables and migrations here.
  */
 const schema = [
   `CREATE TABLE IF NOT EXISTS sources (
@@ -21,6 +40,8 @@ const schema = [
     channel TEXT NOT NULL,
     label TEXT,
     active INTEGER NOT NULL DEFAULT 1,
+    approved_at INTEGER,
+    category TEXT,
     live INTEGER NOT NULL DEFAULT 0,
     viewers INTEGER,
     live_checked_at INTEGER,
@@ -49,6 +70,10 @@ const schema = [
     window_start INTEGER NOT NULL,
     window_end INTEGER NOT NULL,
     status TEXT NOT NULL DEFAULT 'new',
+    block_reason TEXT,
+    clip_file TEXT,
+    clip_bytes INTEGER,
+    clip_duration_ms INTEGER,
     created_at INTEGER NOT NULL,
     UNIQUE(owner_sub, source_id, window_start)
   )`,
@@ -62,6 +87,28 @@ const schema = [
     created_at INTEGER NOT NULL
   )`,
   `CREATE INDEX IF NOT EXISTS events_owner_created ON events(owner_sub, created_at DESC)`,
+  `CREATE TABLE IF NOT EXISTS policies (
+    owner_sub TEXT PRIMARY KEY,
+    paused INTEGER NOT NULL DEFAULT 0,
+    allowed_categories TEXT NOT NULL DEFAULT '[]',
+    blocked_terms TEXT NOT NULL DEFAULT '[]',
+    updated_at INTEGER NOT NULL
+  )`,
+]
+
+/**
+ * Additive changes for databases created by an earlier version. Each runs on
+ * its own; a "duplicate column" error is the expected no-op.
+ */
+const migrations = [
+  `ALTER TABLE candidates ADD COLUMN clip_file TEXT`,
+  `ALTER TABLE candidates ADD COLUMN clip_bytes INTEGER`,
+  `ALTER TABLE candidates ADD COLUMN clip_duration_ms INTEGER`,
+  `ALTER TABLE candidates ADD COLUMN block_reason TEXT`,
+  `ALTER TABLE sources ADD COLUMN approved_at INTEGER`,
+  `ALTER TABLE sources ADD COLUMN category TEXT`,
+  // Channels added by the owner before approval existed are approved.
+  `UPDATE sources SET approved_at = created_at WHERE approved_at IS NULL`,
 ]
 
 const ready = new WeakMap<D1Database, Promise<void>>()
@@ -70,6 +117,15 @@ export function ensureSchema(db: D1Database): Promise<void> {
   if (!pending) {
     pending = db
       .batch(schema.map((sql) => db.prepare(sql)))
+      .then(async () => {
+        for (const sql of migrations) {
+          try {
+            await db.prepare(sql).run()
+          } catch {
+            /* column already exists */
+          }
+        }
+      })
       .then(() => undefined)
       .catch((error) => {
         ready.delete(db)
@@ -80,12 +136,74 @@ export function ensureSchema(db: D1Database): Promise<void> {
   return pending
 }
 
+const parseList = (value: string, max: number): string[] => {
+  try {
+    const parsed = JSON.parse(value) as unknown
+    return Array.isArray(parsed)
+      ? parsed
+          .filter((item): item is string => typeof item === 'string')
+          .slice(0, max)
+      : []
+  } catch {
+    return []
+  }
+}
+
+export type PolicyRow = {
+  paused: number
+  allowed_categories: string
+  blocked_terms: string
+  updated_at: number
+}
+
+export const mapPolicy = (row: PolicyRow): Policy => ({
+  paused: row.paused === 1,
+  allowedCategories: parseList(row.allowed_categories, 30),
+  blockedTerms: parseList(row.blocked_terms, 200),
+  updatedAt: row.updated_at,
+})
+
+/** One policy row per owner, created on first use with the default blocklist. */
+export async function ensurePolicy(db: D1Database, owner: string): Promise<Policy> {
+  const existing = await db
+    .prepare(
+      'SELECT paused, allowed_categories, blocked_terms, updated_at FROM policies WHERE owner_sub = ?',
+    )
+    .bind(owner)
+    .first<PolicyRow>()
+  if (existing) return mapPolicy(existing)
+  const now = Date.now()
+  await db
+    .prepare(
+      `INSERT OR IGNORE INTO policies (owner_sub, paused, allowed_categories, blocked_terms, updated_at)
+       VALUES (?, 0, '[]', ?, ?)`,
+    )
+    .bind(owner, JSON.stringify(DEFAULT_BLOCKED_TERMS), now)
+    .run()
+  const row = await db
+    .prepare(
+      'SELECT paused, allowed_categories, blocked_terms, updated_at FROM policies WHERE owner_sub = ?',
+    )
+    .bind(owner)
+    .first<PolicyRow>()
+  return row
+    ? mapPolicy(row)
+    : {
+        paused: false,
+        allowedCategories: [],
+        blockedTerms: DEFAULT_BLOCKED_TERMS,
+        updatedAt: now,
+      }
+}
+
 export type SourceRow = {
   id: string
   platform: string
   channel: string
   label: string | null
   active: number
+  approved_at: number | null
+  category: string | null
   live: number
   viewers: number | null
   live_checked_at: number | null
@@ -97,6 +215,8 @@ export const mapSource = (row: SourceRow): Source => ({
   channel: row.channel,
   label: row.label,
   active: row.active === 1,
+  approvedAt: row.approved_at,
+  category: row.category,
   live: row.live === 1,
   viewers: row.viewers,
   liveCheckedAt: row.live_checked_at,
@@ -130,6 +250,10 @@ export type CandidateRow = {
   window_start: number
   window_end: number
   status: string
+  block_reason: string | null
+  clip_file: string | null
+  clip_bytes: number | null
+  clip_duration_ms: number | null
   created_at: number
 }
 
@@ -169,6 +293,15 @@ function parseSample(value: string): string[] {
   }
 }
 
+function parseClip(row: CandidateRow): ClipInfo | null {
+  if (!row.clip_file) return null
+  return {
+    fileName: row.clip_file,
+    bytes: row.clip_bytes ?? 0,
+    durationMs: row.clip_duration_ms ?? 0,
+  }
+}
+
 export const mapCandidate = (row: CandidateRow): Candidate => ({
   id: row.id,
   sourceId: row.source_id,
@@ -180,6 +313,8 @@ export const mapCandidate = (row: CandidateRow): Candidate => ({
   windowStart: row.window_start,
   windowEnd: row.window_end,
   status: row.status as CandidateStatus,
+  blockReason: row.block_reason,
+  clip: parseClip(row),
   createdAt: row.created_at,
 })
 

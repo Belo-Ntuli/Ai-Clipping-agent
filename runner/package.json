@@ -6,6 +6,7 @@
     "doctor": "bun run src/index.ts doctor",
     "start": "bun run src/index.ts start",
     "mock": "bun run src/index.ts mock",
+    "demo": "bun run src/index.ts demo",
     "typecheck": "bunx tsc --noEmit -p tsconfig.json"
   }
 }

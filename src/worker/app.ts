@@ -4,6 +4,7 @@ import { Hono, type Handler } from 'hono'
 import { bodyLimit } from 'hono/body-limit'
 import { appOrigin, currentUser, isLocalPreview, type Env } from './auth'
 import {
+  ensurePolicy,
   ensureSchema,
   mapCandidate,
   mapEvent,
@@ -14,7 +15,8 @@ import {
   type RunnerRow,
   type SourceRow,
 } from './db'
-import type { Candidate } from '../shared/types'
+import { cleanList, screenMoment } from '../shared/policy'
+import type { Candidate, Platform, Policy } from '../shared/types'
 
 type AppContext = {
   Bindings: Env
@@ -112,6 +114,7 @@ export function createApp(authenticate: Authenticate = currentUser) {
     '/api/sources',
     '/api/sources/*',
     '/api/candidates/*',
+    '/api/policy',
     '/api/runners',
     '/api/runners/*',
   ])
@@ -121,16 +124,17 @@ export function createApp(authenticate: Authenticate = currentUser) {
     const db = c.get('db')
     const owner = c.get('user').sub
     const now = Date.now()
+    const policy = await ensurePolicy(db, owner)
     const [sources, candidates, events, runners] = await Promise.all([
       db
         .prepare(
-          'SELECT id, platform, channel, label, active, live, viewers, live_checked_at, created_at FROM sources WHERE owner_sub = ? ORDER BY created_at ASC',
+          'SELECT id, platform, channel, label, active, approved_at, category, live, viewers, live_checked_at, created_at FROM sources WHERE owner_sub = ? ORDER BY created_at ASC',
         )
         .bind(owner)
         .all<SourceRow>(),
       db
         .prepare(
-          'SELECT id, source_id, platform, channel, score, signals, sample, window_start, window_end, status, created_at FROM candidates WHERE owner_sub = ? ORDER BY created_at DESC LIMIT 60',
+          'SELECT id, source_id, platform, channel, score, signals, sample, window_start, window_end, status, block_reason, clip_file, clip_bytes, clip_duration_ms, created_at FROM candidates WHERE owner_sub = ? ORDER BY created_at DESC LIMIT 60',
         )
         .bind(owner)
         .all<CandidateRow>(),
@@ -152,7 +156,54 @@ export function createApp(authenticate: Authenticate = currentUser) {
       candidates: candidates.results.map(mapCandidate),
       events: events.results.map(mapEvent),
       runners: runners.results.map((row) => mapRunner(row, now)),
+      policy,
     })
+  })
+
+  // Owner guardrails: a kill switch, a category allowlist and a blocklist.
+  // Adding a channel is the approval act; this is what governs what gets cut.
+  app.patch('/api/policy', async (c) => {
+    const body: unknown = await c.req.json().catch(() => null)
+    if (!body || typeof body !== 'object' || Array.isArray(body))
+      return c.json({ error: 'Nothing to update.' }, 400)
+    const record = body as Record<string, unknown>
+    const paused =
+      typeof record.paused === 'boolean' ? Number(record.paused) : undefined
+    const categories =
+      record.allowedCategories === undefined
+        ? undefined
+        : cleanList(record.allowedCategories, 30, 60)
+    const terms =
+      record.blockedTerms === undefined
+        ? undefined
+        : cleanList(record.blockedTerms, 200, 40)
+    if (paused === undefined && !categories && !terms)
+      return c.json(
+        { error: 'Send paused, allowedCategories or blockedTerms.' },
+        400,
+      )
+    const db = c.get('db')
+    const owner = c.get('user').sub
+    await ensurePolicy(db, owner)
+    await db
+      .prepare(
+        `UPDATE policies SET
+           paused = COALESCE(?, paused),
+           allowed_categories = COALESCE(?, allowed_categories),
+           blocked_terms = COALESCE(?, blocked_terms),
+           updated_at = ?
+         WHERE owner_sub = ?`,
+      )
+      .bind(
+        paused ?? null,
+        categories ? JSON.stringify(categories) : null,
+        terms ? JSON.stringify(terms) : null,
+        Date.now(),
+        owner,
+      )
+      .run()
+    const policy: Policy = await ensurePolicy(db, owner)
+    return c.json({ policy })
   })
 
   app.post('/api/sources', async (c) => {
@@ -177,9 +228,10 @@ export function createApp(authenticate: Authenticate = currentUser) {
     const inserted = await c
       .get('db')
       .prepare(
-        'INSERT OR IGNORE INTO sources (id, owner_sub, platform, channel, label, active, created_at) VALUES (?, ?, ?, ?, ?, 1, ?) RETURNING id, platform, channel, label, active, live, viewers, live_checked_at, created_at',
+        'INSERT OR IGNORE INTO sources (id, owner_sub, platform, channel, label, active, approved_at, created_at) VALUES (?, ?, ?, ?, ?, 1, ?, ?) RETURNING id, platform, channel, label, active, approved_at, category, live, viewers, live_checked_at, created_at',
       )
-      .bind(id, c.get('user').sub, platform, channel.toLowerCase(), label, now)
+      // Adding the channel is the owner's approval: nothing else can create one.
+      .bind(id, c.get('user').sub, platform, channel.toLowerCase(), label, now, now)
       .first<SourceRow>()
     return inserted
       ? c.json({ source: mapSource(inserted) }, 201)
@@ -203,7 +255,7 @@ export function createApp(authenticate: Authenticate = currentUser) {
            active = COALESCE(?, active),
            label = COALESCE(?, label)
          WHERE id = ? AND owner_sub = ?
-         RETURNING id, platform, channel, label, active, live, viewers, live_checked_at, created_at`,
+         RETURNING id, platform, channel, label, active, approved_at, category, live, viewers, live_checked_at, created_at`,
       )
       .bind(active ?? null, label ?? null, c.req.param('id'), c.get('user').sub)
       .first<SourceRow>()
@@ -234,7 +286,7 @@ export function createApp(authenticate: Authenticate = currentUser) {
     const row = await c
       .get('db')
       .prepare(
-        'UPDATE candidates SET status = ? WHERE id = ? AND owner_sub = ? RETURNING id, source_id, platform, channel, score, signals, sample, window_start, window_end, status, created_at',
+        'UPDATE candidates SET status = ? WHERE id = ? AND owner_sub = ? RETURNING id, source_id, platform, channel, score, signals, sample, window_start, window_end, status, block_reason, clip_file, clip_bytes, clip_duration_ms, created_at',
       )
       .bind(decision, c.req.param('id'), c.get('user').sub)
       .first<CandidateRow>()
@@ -335,20 +387,30 @@ export function createApp(authenticate: Authenticate = currentUser) {
       const id = str(entry.sourceId, 64)
       const live = typeof entry.live === 'boolean' ? Number(entry.live) : null
       if (!id || live === null) continue
+      // The category is what the owner's category allowlist is checked against,
+      // so it is stored whenever the platform reports one.
+      const category = str(entry.category, 60)
       await db
         .prepare(
-          'UPDATE sources SET live = ?, viewers = ?, live_checked_at = ? WHERE id = ? AND owner_sub = ?',
+          `UPDATE sources SET live = ?, viewers = ?, live_checked_at = ?,
+             category = COALESCE(?, category)
+           WHERE id = ? AND owner_sub = ?`,
         )
-        .bind(live, num(entry.viewers, 0, 50_000_000), now, id, owner)
+        .bind(live, num(entry.viewers, 0, 50_000_000), now, category, id, owner)
         .run()
     }
     const rows = await db
       .prepare(
-        'SELECT id, platform, channel, label, active, live, viewers, live_checked_at, created_at FROM sources WHERE owner_sub = ? AND active = 1 ORDER BY created_at ASC',
+        'SELECT id, platform, channel, label, active, approved_at, category, live, viewers, live_checked_at, created_at FROM sources WHERE owner_sub = ? AND active = 1 ORDER BY created_at ASC',
       )
       .bind(owner)
       .all<SourceRow>()
-    return c.json({ sources: rows.results.map(mapSource) })
+    // The policy rides along so the runner can refuse a moment before spending
+    // time buffering or cutting it.
+    return c.json({
+      sources: rows.results.map(mapSource),
+      policy: await ensurePolicy(db, owner),
+    })
   })
 
   app.post('/api/runner/candidates', async (c) => {
@@ -361,6 +423,7 @@ export function createApp(authenticate: Authenticate = currentUser) {
       return c.json({ error: 'Send 1-20 candidates.' }, 400)
     const db = c.get('db') ?? c.env.DB!
     const owner = c.get('runner').owner_sub
+    const policy = await ensurePolicy(db, owner)
     const accepted: Candidate[] = []
     for (const item of list) {
       if (!item || typeof item !== 'object' || Array.isArray(item)) continue
@@ -391,12 +454,68 @@ export function createApp(authenticate: Authenticate = currentUser) {
             .slice(0, 6)
             .map((line) => line.slice(0, 200))
         : []
+      // A cut clip rides along with its candidate. Only its metadata is sent:
+      // the media file stays on the runner that captured it.
+      let clipFile: string | null = null
+      let clipBytes: number | null = null
+      let clipDurationMs: number | null = null
+      if (
+        record.clip &&
+        typeof record.clip === 'object' &&
+        !Array.isArray(record.clip)
+      ) {
+        const clip = record.clip as Record<string, unknown>
+        const fileName = str(clip.fileName, 160)
+        const bytes = num(clip.bytes, 0, 5_000_000_000)
+        const durationMs = num(clip.durationMs, 0, 600_000)
+        if (fileName && bytes !== null && durationMs !== null) {
+          clipFile = fileName.replace(/[/\\]/g, '_')
+          clipBytes = Math.round(bytes)
+          clipDurationMs = Math.round(durationMs)
+        }
+      }
+      // The dashboard is the authority on policy, not the runner: every moment
+      // is re-checked on arrival, so a stale or modified runner cannot queue
+      // something the owner refused. A refusal is stored with its reason.
+      const source = await db
+        .prepare(
+          'SELECT id, platform, channel, label, active, approved_at, category, live, viewers, live_checked_at, created_at FROM sources WHERE id = ? AND owner_sub = ?',
+        )
+        .bind(sourceId, owner)
+        .first<SourceRow>()
+      // Reporting on a channel the owner removed is not an error, just noise.
+      if (!source) continue
+      let status: 'new' | 'blocked' = 'new'
+      let blockReason: string | null = null
+      if (source.approved_at === null) {
+        status = 'blocked'
+        blockReason = 'channel not approved'
+      } else {
+        const verdict = screenMoment(
+          {
+            platform: source.platform as Platform,
+            channel: source.channel,
+            category: source.category,
+            sample,
+          },
+          policy,
+        )
+        if (!verdict.allowed) {
+          status = 'blocked'
+          blockReason = verdict.reason
+        }
+      }
+      if (status === 'blocked') {
+        clipFile = null
+        clipBytes = null
+        clipDurationMs = null
+      }
       const row = await db
         .prepare(
           `INSERT OR IGNORE INTO candidates
-             (id, owner_sub, source_id, platform, channel, score, signals, sample, window_start, window_end, status, created_at)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'new', ?)
-           RETURNING id, source_id, platform, channel, score, signals, sample, window_start, window_end, status, created_at`,
+             (id, owner_sub, source_id, platform, channel, score, signals, sample, window_start, window_end, status, block_reason, clip_file, clip_bytes, clip_duration_ms, created_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+           RETURNING id, source_id, platform, channel, score, signals, sample, window_start, window_end, status, block_reason, clip_file, clip_bytes, clip_duration_ms, created_at`,
         )
         .bind(
           crypto.randomUUID(),
@@ -415,6 +534,11 @@ export function createApp(authenticate: Authenticate = currentUser) {
           JSON.stringify(sample),
           Math.round(windowStart),
           Math.round(windowEnd),
+          status,
+          blockReason,
+          clipFile,
+          clipBytes,
+          clipDurationMs,
           Date.now(),
         )
         .first<CandidateRow>()

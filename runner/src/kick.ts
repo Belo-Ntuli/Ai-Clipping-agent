@@ -50,7 +50,8 @@ export class KickClient {
 
   async liveStatus(slugs: string[]): Promise<Map<string, LiveInfo>> {
     const result = new Map<string, LiveInfo>()
-    for (const slug of slugs) result.set(slug, { live: false, viewers: null })
+    for (const slug of slugs)
+      result.set(slug, { live: false, viewers: null, category: null })
     if (!this.configured || slugs.length === 0) return result
     const token = await this.appToken()
     for (const slug of slugs.slice(0, 5)) {
@@ -81,6 +82,10 @@ export class KickClient {
         live,
         viewers:
           typeof stream?.viewer_count === 'number' ? stream.viewer_count : null,
+        // Kick's category field is not in the response shape we have verified,
+        // so it stays null: an allowlist therefore refuses Kick moments until
+        // the category is known. Failing closed is the point.
+        category: null,
       })
     }
     return result

@@ -350,6 +350,82 @@ test('rejects foreign origins, owner spoofing, malformed input and oversized bod
   ).toBe(400)
 })
 
+test('a cut clip rides along with its candidate as metadata only', async () => {
+  await call('/api/sources', 'carol', 'POST', {
+    platform: 'kick',
+    channel: 'carolstream',
+  })
+  const created = (await (
+    await call('/api/runners', 'carol', 'POST', { name: 'iMac' })
+  ).json()) as { token: string }
+  const sources = (await (
+    await asRunner('/api/runner/heartbeat', created.token, { observed: [] })
+  ).json()) as { sources: Array<{ id: string }> }
+  const sourceId = sources.sources[0]!.id
+
+  const posted = (await (
+    await asRunner('/api/runner/candidates', created.token, {
+      candidates: [
+        {
+          sourceId,
+          platform: 'kick',
+          channel: 'carolstream',
+          score: 66,
+          signals: {
+            chatZ: 2.4,
+            messages: 18,
+            keywords: ['lol'],
+            emoteBurst: 5,
+            windowSeconds: 30,
+          },
+          sample: ['KEKW'],
+          windowStart: 1_700_000_100_000,
+          windowEnd: 1_700_000_130_000,
+          // A path separator must not survive validation.
+          clip: {
+            fileName: '../escape/clip.mp4',
+            bytes: 5_242_880,
+            durationMs: 44_000,
+          },
+        },
+      ],
+    })
+  ).json()) as { accepted: Array<{ id: string }> }
+  expect(posted.accepted).toHaveLength(1)
+
+  const overview = (await (await call('/api/overview', 'carol')).json()) as {
+    candidates: Array<{
+      clip: { fileName: string; bytes: number; durationMs: number } | null
+    }>
+  }
+  expect(overview.candidates[0]!.clip).toEqual({
+    fileName: '.._escape_clip.mp4',
+    bytes: 5_242_880,
+    durationMs: 44_000,
+  })
+
+  // An unusable clip object is dropped rather than stored half-valid.
+  await asRunner('/api/runner/candidates', created.token, {
+    candidates: [
+      {
+        sourceId,
+        platform: 'kick',
+        channel: 'carolstream',
+        score: 60,
+        signals: { chatZ: 1, messages: 3, keywords: [], emoteBurst: 0, windowSeconds: 30 },
+        sample: [],
+        windowStart: 1_700_000_200_000,
+        windowEnd: 1_700_000_230_000,
+        clip: { fileName: '', bytes: -1 },
+      },
+    ],
+  })
+  const after = (await (await call('/api/overview', 'carol')).json()) as {
+    candidates: Array<{ clip: unknown }>
+  }
+  expect(after.candidates[0]!.clip).toBeNull()
+})
+
 test('missing database reports setup and local preview identity never activates on hosted origins', async () => {
   const noDb = await app.request(
     'https://app.example.test/api/overview',
@@ -368,4 +444,111 @@ test('missing database reports setup and local preview identity never activates 
   expect(
     await currentUser(new Request('http://localhost:5000/'), {} as Env),
   ).toMatchObject({ sub: 'local-preview' })
+})
+
+test('content rules filter moments on arrival, with a reason the owner can read', async () => {
+  await call('/api/sources', 'dave', 'POST', {
+    platform: 'twitch',
+    channel: 'davechan',
+  })
+  const created = (await (
+    await call('/api/runners', 'dave', 'POST', { name: 'Mac' })
+  ).json()) as { token: string }
+  const beat = (await (
+    await asRunner('/api/runner/heartbeat', created.token, { observed: [] })
+  ).json()) as {
+    sources: Array<{ id: string; approvedAt: number | null }>
+    policy: { paused: boolean; blockedTerms: string[] }
+  }
+  // A channel added by the owner is approved, and a policy ships with it.
+  expect(beat.sources[0]!.approvedAt).not.toBeNull()
+  expect(beat.policy.paused).toBe(false)
+  expect(beat.policy.blockedTerms.length).toBeGreaterThan(0)
+  const sourceId = beat.sources[0]!.id
+
+  const say = (category: string) =>
+    asRunner('/api/runner/heartbeat', created.token, {
+      observed: [{ sourceId, live: true, viewers: 10, category }],
+    })
+  await say('Just Chatting')
+  const stored = (await (await call('/api/overview', 'dave')).json()) as {
+    sources: Array<{ category: string | null }>
+  }
+  expect(stored.sources[0]!.category).toBe('Just Chatting')
+
+  expect(
+    (
+      await call('/api/policy', 'dave', 'PATCH', {
+        allowedCategories: ['Grand Theft Auto V'],
+      })
+    ).status,
+  ).toBe(200)
+
+  const post = (start: number, sample: string[]) =>
+    asRunner('/api/runner/candidates', created.token, {
+      candidates: [
+        {
+          sourceId,
+          platform: 'twitch',
+          channel: 'davechan',
+          score: 80,
+          signals: {
+            chatZ: 3,
+            messages: 40,
+            keywords: ['no way'],
+            emoteBurst: 4,
+            windowSeconds: 30,
+          },
+          sample,
+          windowStart: start,
+          windowEnd: start + 30_000,
+        },
+      ],
+    })
+  const verdict = async (start: number, sample: string[]) => {
+    const body = (await (await post(start, sample)).json()) as {
+      accepted: Array<{ status: string; blockReason: string | null }>
+    }
+    return body.accepted[0]!
+  }
+
+  // Wrong category: refused before review.
+  const wrong = await verdict(1_700_001_000_000, ['no way'])
+  expect(wrong.status).toBe('blocked')
+  expect(wrong.blockReason).toContain('category')
+
+  // Right category, but a default blocklist word in the chat.
+  await say('Grand Theft Auto V')
+  const dirty = await verdict(1_700_001_100_000, ['bro is doing cocaine on stream'])
+  expect(dirty.status).toBe('blocked')
+  expect(dirty.blockReason).toBe('blocked term: cocaine')
+
+  // A clip is never recorded for a refused moment.
+  const clean = await verdict(1_700_001_200_000, ['NO WAY', 'clip it'])
+  expect(clean.status).toBe('new')
+
+  // Pausing refuses even a clean, allowed-category moment.
+  await call('/api/policy', 'dave', 'PATCH', { paused: true })
+  const paused = await verdict(1_700_001_300_000, ['NO WAY'])
+  expect(paused.status).toBe('blocked')
+  expect(paused.blockReason).toBe('clipping is paused')
+
+  // Refusals are visible to the owner, and none of them are reviewable.
+  const overview = (await (await call('/api/overview', 'dave')).json()) as {
+    policy: { paused: boolean }
+    candidates: Array<{ status: string; blockReason: string | null }>
+  }
+  expect(overview.policy.paused).toBe(true)
+  expect(
+    overview.candidates.filter((item) => item.status === 'blocked' && item.blockReason)
+      .length,
+  ).toBe(3)
+
+  // Policy writes are validated and owner-scoped.
+  expect((await call('/api/policy', 'dave', 'PATCH', {})).status).toBe(400)
+  const bob = (await (await call('/api/overview', 'bob')).json()) as {
+    policy: { paused: boolean; allowedCategories: string[] }
+  }
+  expect(bob.policy.paused).toBe(false)
+  expect(bob.policy.allowedCategories).toEqual([])
 })

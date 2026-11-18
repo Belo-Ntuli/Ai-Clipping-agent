@@ -91,7 +91,17 @@ tokens that **expire after 7 days**, with at most 100 test users. Moving to
 production unlocks long-lived tokens but `youtube.upload` is a sensitive scope,
 so it needs verification. Build the reconnect path: expect to re-authorize
 weekly while the app is in Testing, and surface it as a banner plus a runner
-event instead of failing silently.
+event instead of failing silently. Google accepts `http://localhost` redirect
+URIs for development, so no HTTPS or public domain is needed to set this up. The
+scope string is `https://www.googleapis.com/auth/youtube.upload`.
+
+**Shorts classification:** there is no Shorts endpoint, no `publishAsShort`
+flag, and no hashtag requirement. `videos.insert` is the only upload method, and
+YouTube decides after the fact from the file: **square or vertical, 3 minutes or
+less** for uploads on or after 15 Oct 2024. A 16:9 file stays long-form however
+short it is. Also: a Short **over one minute** with an active Content ID claim is
+blocked worldwide, which matters when the footage is someone else's stream.
+Setup walkthrough: [youtube-setup.md](youtube-setup.md).
 
 ## Content Rewards
 

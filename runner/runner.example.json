@@ -5,6 +5,14 @@
   "cooldownSeconds": 90,
   "historyBuckets": 8,
   "maxChannels": 5,
+  "clip": {
+    "enabled": true,
+    "segmentSeconds": 6,
+    "segments": 30,
+    "preRollSeconds": 40,
+    "durationSeconds": 44,
+    "postRollSeconds": 4
+  },
   "twitch": {
     "clientId": "",
     "clientSecret": ""

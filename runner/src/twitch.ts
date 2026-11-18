@@ -1,4 +1,9 @@
-export type LiveInfo = { live: boolean; viewers: number | null }
+export type LiveInfo = {
+  live: boolean
+  viewers: number | null
+  /** Game/category name when the platform tells us; null otherwise. */
+  category: string | null
+}
 
 /**
  * Twitch: app access token for public reads, and anonymous IRC for chat.
@@ -47,7 +52,8 @@ export class TwitchClient {
   /** One request covers up to 100 channels. */
   async liveStatus(logins: string[]): Promise<Map<string, LiveInfo>> {
     const result = new Map<string, LiveInfo>()
-    for (const login of logins) result.set(login, { live: false, viewers: null })
+    for (const login of logins)
+      result.set(login, { live: false, viewers: null, category: null })
     if (!this.configured || logins.length === 0) return result
     const token = await this.appToken()
     const params = new URLSearchParams()
@@ -62,7 +68,11 @@ export class TwitchClient {
     if (!response.ok)
       throw new Error(`Twitch streams request failed (${response.status})`)
     const payload = (await response.json()) as {
-      data?: Array<{ user_login?: string; viewer_count?: number }>
+      data?: Array<{
+        user_login?: string
+        viewer_count?: number
+        game_name?: string
+      }>
     }
     for (const stream of payload.data ?? []) {
       const login = stream.user_login?.toLowerCase()
@@ -71,6 +81,11 @@ export class TwitchClient {
         live: true,
         viewers:
           typeof stream.viewer_count === 'number' ? stream.viewer_count : null,
+        // Helix returns the stream's category as `game_name`.
+        category:
+          typeof stream.game_name === 'string' && stream.game_name.trim()
+            ? stream.game_name.trim()
+            : null,
       })
     }
     return result

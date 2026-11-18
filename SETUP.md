@@ -13,6 +13,21 @@ bun run dev
 Open the printed URL. On a loopback origin the app uses a labelled local preview
 identity; once published it uses Sign in with Freebuff.
 
+That fallback is deliberately **loopback-only**. Opening the app through any
+other hostname (a tunnel, a LAN IP, a cloud preview) shows "still being set
+up" instead of a user — that is the guard working, not a bug. To use the
+dashboard from another device, publish it and sign in.
+
+While developing you can opt one hostname in, if you need to inspect the real
+thing through a tunnel:
+
+```sh
+wrangler dev --var LOCAL_PREVIEW_HOSTS:your-tunnel-host
+```
+
+It still does nothing once `APP_ORIGIN` or `FREEBUFF_CLIENT_ID` is set, so a
+deployment can never inherit it. Never add it to a deployed environment.
+
 ## 2. Runner on the Mac
 
 ```sh
@@ -29,7 +44,30 @@ displayed once. Revoking it in the dashboard stops that runner immediately.
 `runner.json`'s `dashboardUrl` must match the URL the dev server actually
 printed — set it to `http://localhost:3000` if that is the port in use.
 
-## 3. Keep it running (macOS)
+## 3. Video tooling (needed to cut clips)
+
+```sh
+brew install ffmpeg streamlink
+```
+
+- **ffmpeg / ffprobe** — writes the segment ring buffer and cuts the clip.
+  Without it the runner still detects moments from chat, but nothing is cut.
+- **streamlink** (or `yt-dlp`) — resolves a playable URL for a Twitch or Kick
+  channel, because neither public API exposes one. With neither installed the
+  runner logs a warning and capture stays off.
+
+`bun run runner doctor` reports all three, plus free disk. Budget roughly
+3 minutes × bitrate per live channel for the buffer (~500 MB for two 1080p60
+channels) and keep rejected clips pruned; the buffer overwrites itself, the
+clips folder does not.
+
+Check it works without any stream or credentials:
+
+```sh
+bun run runner demo     # buffers a synthetic stream, cuts and probes a clip
+```
+
+## 4. Keep it running (macOS)
 
 ```sh
 chmod +x runner/scripts/*.sh
@@ -50,7 +88,7 @@ Logs: `~/Library/Logs/clipper-runner.log`. Stop it with:
 launchctl bootout gui/$(id -u) ~/Library/LaunchAgents/com.clipper.runner.plist
 ```
 
-## 4. Twitch (needed for live status and chat)
+## 5. Twitch (needed for live status and chat)
 
 1. Enable two-factor authentication on the Twitch account.
 2. https://dev.twitch.tv/console/apps → Register Your Application. Any name; the
@@ -61,7 +99,7 @@ launchctl bootout gui/$(id -u) ~/Library/LaunchAgents/com.clipper.runner.plist
 
 Chat needs nothing extra: the runner reads it anonymously over IRC.
 
-## 5. Kick (stream status now, chat later)
+## 6. Kick (stream status now, chat later)
 
 1. Enable two-factor authentication, then account settings → **Developer**.
 2. Create an app; copy the client id and secret.
@@ -70,16 +108,19 @@ Chat needs nothing extra: the runner reads it anonymously over IRC.
 Kick chat is webhooks-only and requires a publicly reachable URL. That receiver
 belongs on the dashboard (phase B), not on the Mac — do not add a tunnel.
 
-## 6. Later phases
+## 7. Later phases
 
 - **TikTok** — register an app, add Content Posting API, request `video.upload`
   first (drafts, avoids the audit gate), then `video.publish`. App review wants
   a real website with a privacy policy, so the published dashboard origin is the
   natural home for it.
-- **YouTube** — Google Cloud project → enable YouTube Data API v3 → OAuth
-  consent screen (External) → add yourself as a test user → OAuth client with
-  the dashboard callback. Expect refresh tokens to expire every 7 days while the
-  app is in Testing.
+- **YouTube** — see [docs/youtube-setup.md](docs/youtube-setup.md) for the full
+  walkthrough: project, API, consent screen test user, OAuth client with the
+  localhost callback, and the `youtube.upload` scope. Two things bite: refresh
+  tokens expire every 7 days while the app is in Testing, and uploads have their
+  own 100/day quota bucket. Note YouTube is a **posting target**, not a live
+  source: capturing YouTube streams to re-upload is not allowed; clip from
+  campaign-supplied VODs instead.
 - **Instagram** — the account must be a Business account for Reels publishing.
 - **Content Rewards** — connect accounts on contentrewards.com; campaigns supply
   the rate, brief and accepted platforms the dashboard imports.

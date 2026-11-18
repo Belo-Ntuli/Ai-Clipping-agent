@@ -1,9 +1,17 @@
-import type { Source } from '../../src/shared/types'
+import type { Policy, Source } from '../../src/shared/types'
 
 export type Observed = {
   sourceId: string
   live: boolean
   viewers: number | null
+  /** Whatever category the platform reports; drives the owner's allowlist. */
+  category: string | null
+}
+
+export type ClipPayload = {
+  fileName: string
+  bytes: number
+  durationMs: number
 }
 
 export type CandidatePayload = {
@@ -21,6 +29,7 @@ export type CandidatePayload = {
   sample: string[]
   windowStart: number
   windowEnd: number
+  clip?: ClipPayload
 }
 
 export type EventPayload = {
@@ -58,8 +67,13 @@ export class DashboardClient {
     return (await response.json()) as T
   }
 
-  /** Proves the runner is alive and returns the current watchlist. */
-  heartbeat(observed: Observed[]): Promise<{ sources: Source[] }> {
+  /**
+   * Proves the runner is alive and returns the current watchlist plus the
+   * owner's policy, so a moment can be refused before any encoding work.
+   */
+  heartbeat(
+    observed: Observed[],
+  ): Promise<{ sources: Source[]; policy: Policy }> {
     return this.call('/api/runner/heartbeat', { observed })
   }
 

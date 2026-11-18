@@ -1,6 +1,15 @@
 import { existsSync, readFileSync } from 'node:fs'
 import { dirname, join } from 'node:path'
 
+export type ClipConfig = {
+  enabled: boolean
+  segmentSeconds: number
+  segments: number
+  preRollSeconds: number
+  durationSeconds: number
+  postRollSeconds: number
+}
+
 export type RunnerConfig = {
   dashboardUrl: string
   tickSeconds: number
@@ -9,6 +18,9 @@ export type RunnerConfig = {
   historyBuckets: number
   maxChannels: number
   token: string
+  clip: ClipConfig
+  bufferRoot: string
+  clipsRoot: string
   twitch: { clientId: string; clientSecret: string }
   kick: { clientId: string; clientSecret: string }
 }
@@ -42,6 +54,16 @@ type FileShape = {
   cooldownSeconds?: unknown
   historyBuckets?: unknown
   maxChannels?: unknown
+  bufferDir?: unknown
+  clipsDir?: unknown
+  clip?: {
+    enabled?: unknown
+    segmentSeconds?: unknown
+    segments?: unknown
+    preRollSeconds?: unknown
+    durationSeconds?: unknown
+    postRollSeconds?: unknown
+  }
   twitch?: { clientId?: unknown; clientSecret?: unknown }
   kick?: { clientId?: unknown; clientSecret?: unknown }
 }
@@ -62,6 +84,8 @@ export function loadConfig(): RunnerConfig {
     (typeof file.dashboardUrl === 'string' && file.dashboardUrl) ||
     'http://localhost:5173'
   const token = process.env.CLIPPER_RUNNER_TOKEN?.trim() || ''
+  const preRollSeconds = positive(file.clip?.preRollSeconds, 40, 600)
+  const postRollSeconds = positive(file.clip?.postRollSeconds, 4, 120)
   return {
     dashboardUrl: dashboardUrl.replace(/\/$/, ''),
     tickSeconds: positive(file.tickSeconds, 30, 600),
@@ -70,6 +94,26 @@ export function loadConfig(): RunnerConfig {
     historyBuckets: positive(file.historyBuckets, 8, 40),
     maxChannels: positive(file.maxChannels, 5, 50),
     token,
+    clip: {
+      enabled: file.clip?.enabled !== false,
+      segmentSeconds: positive(file.clip?.segmentSeconds, 6, 60),
+      segments: positive(file.clip?.segments, 30, 600),
+      preRollSeconds,
+      postRollSeconds,
+      durationSeconds: positive(
+        file.clip?.durationSeconds,
+        preRollSeconds + postRollSeconds,
+        900,
+      ),
+    },
+    bufferRoot:
+      typeof file.bufferDir === 'string' && file.bufferDir
+        ? file.bufferDir
+        : join(runnerRoot, 'buffer'),
+    clipsRoot:
+      typeof file.clipsDir === 'string' && file.clipsDir
+        ? file.clipsDir
+        : join(runnerRoot, 'clips'),
     twitch: {
       clientId:
         process.env.TWITCH_CLIENT_ID?.trim() ||

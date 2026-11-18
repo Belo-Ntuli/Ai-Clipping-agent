@@ -40,6 +40,12 @@ const KEYWORDS = [
   'gg',
 ]
 
+/**
+ * Twitch/Kick emotes people type as words, compared lower-cased.
+ * Deliberately excludes ambiguous everyday words (`based`, `clap`, `pog` as a
+ * word): those still register in caps via CAPS_EMOTE, but a normal sentence
+ * must never inflate an emote burst.
+ */
 const KNOWN_EMOTES = new Set([
   'kekw',
   'lulw',
@@ -53,11 +59,36 @@ const KNOWN_EMOTES = new Set([
   'sadge',
   'copium',
   'jebaited',
-  'clap',
   'nodders',
+  'catjam',
+  'widepeepohappy',
 ])
 
 const MAX_AGE_MS = 10 * 60_000
+
+/**
+ * An emote in raw text is either a known emote name, or an all-caps token of
+ * four or more characters (`KEKW`, `BASED`, `POGGERS`). Case matters: the raw
+ * message is tested, never the lower-cased copy, so ordinary repeated words
+ * ("this", "mission") can never register as an emote.
+ */
+const CAPS_EMOTE = /^[A-Z][A-Z0-9]{3,}$/
+
+/** Whole-word match, so `yo` does not fire inside "you" or `what` in "somewhat". */
+export function hasWord(text: string, word: string): boolean {
+  let from = 0
+  while (from <= text.length - word.length) {
+    const index = text.indexOf(word, from)
+    if (index === -1) return false
+    const before = index === 0 ? undefined : text[index - 1]
+    const after = text[index + word.length]
+    const boundary = (char: string | undefined) =>
+      char === undefined || !/[a-z0-9]/i.test(char)
+    if (boundary(before) && boundary(after)) return true
+    from = index + 1
+  }
+  return false
+}
 
 export class ChatMeter {
   private messages: ChatMessage[] = []
@@ -104,24 +135,30 @@ export class ChatMeter {
     this.history.push(count)
     if (this.history.length > this.historyBuckets) this.history.shift()
 
-    const lowered = recent.map((message) => message.text.toLowerCase())
     const keywords = KEYWORDS.filter((word) =>
-      lowered.some((text) => text.includes(word)),
+      recent.some((message) => hasWord(message.text.toLowerCase(), word)),
     )
 
-    // A burst is the same token repeated by many people: the strongest
-    // cheap proxy for "the whole chat reacted to the same thing".
-    const counts = new Map<string, number>()
-    for (const text of lowered)
-      for (const token of text.split(/[^a-z0-9]+/)) {
+    // A burst is many *people* typing the same emote, so count distinct
+    // messages rather than raw occurrences: one person spamming is not a burst.
+    const perEmote = new Map<string, Set<number>>()
+    recent.forEach((message, index) => {
+      for (const token of message.text.split(/[^A-Za-z0-9]+/)) {
         if (!token) continue
-        const isEmote =
-          KNOWN_EMOTES.has(token) || (token.length >= 3 && !/[^a-z]/.test(token) && token.length >= 4)
+        const lower = token.toLowerCase()
+        const isEmote = KNOWN_EMOTES.has(lower) || CAPS_EMOTE.test(token)
         if (!isEmote) continue
-        counts.set(token, (counts.get(token) ?? 0) + 1)
+        let seen = perEmote.get(lower)
+        if (!seen) {
+          seen = new Set()
+          perEmote.set(lower, seen)
+        }
+        seen.add(index)
       }
+    })
     let emoteBurst = 0
-    for (const value of counts.values()) emoteBurst = Math.max(emoteBurst, value)
+    for (const seen of perEmote.values())
+      emoteBurst = Math.max(emoteBurst, seen.size)
 
     return {
       chatZ: Number(chatZ.toFixed(2)),
@@ -140,7 +177,7 @@ export class ChatMeter {
       .sort((left, right) => right.at - left.at)
     const interesting = recent.filter((message) => {
       const text = message.text.toLowerCase()
-      return KEYWORDS.some((word) => text.includes(word))
+      return KEYWORDS.some((word) => hasWord(text, word))
     })
     const chosen = [...interesting, ...recent]
     const seen = new Set<string>()
@@ -160,6 +197,7 @@ export class ChatMeter {
 export function scoreSignal(signal: Signal): number {
   const velocity = Math.max(0, signal.chatZ) * 20
   const words = signal.keywords.length * 9
+  // Burst is a count of distinct messages; a single message is not a burst.
   const burst = Math.max(0, signal.emoteBurst - 1) * 6
   const volume = signal.messages >= 12 ? 6 : 0
   return Math.max(0, Math.min(100, Math.round(velocity + words + burst + volume)))

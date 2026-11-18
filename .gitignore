@@ -7,3 +7,7 @@ dist/
 !.env.example
 runner/runner.json
 runner/.env
+runner/buffer/
+runner/clips/
+
+.scratch/
