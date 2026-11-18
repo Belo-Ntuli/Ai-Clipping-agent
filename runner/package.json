@@ -1,0 +1,11 @@
+{
+  "name": "clipper-runner",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "doctor": "bun run src/index.ts doctor",
+    "start": "bun run src/index.ts start",
+    "mock": "bun run src/index.ts mock",
+    "typecheck": "bunx tsc --noEmit -p tsconfig.json"
+  }
+}

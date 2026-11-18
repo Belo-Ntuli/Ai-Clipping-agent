@@ -1,0 +1,16 @@
+{
+  "dashboardUrl": "http://localhost:5173",
+  "tickSeconds": 30,
+  "scoreThreshold": 55,
+  "cooldownSeconds": 90,
+  "historyBuckets": 8,
+  "maxChannels": 5,
+  "twitch": {
+    "clientId": "",
+    "clientSecret": ""
+  },
+  "kick": {
+    "clientId": "",
+    "clientSecret": ""
+  }
+}
